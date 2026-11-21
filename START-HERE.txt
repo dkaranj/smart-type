@@ -1,0 +1,10 @@
+SMART TYPE - START HERE
+
+1. Extract this ZIP.
+2. Upload the CONTENTS of the SmartType folder to https://github.com/dkaranj/smart-type
+   (The .github folder must be included.)
+3. In GitHub, open Actions > Build Smart Type for Windows > Run workflow.
+4. Download the SmartType-Windows artifact when the workflow succeeds.
+
+For local testing, follow README.md.
+You need a Gemini API key and Visual Studio Code.
