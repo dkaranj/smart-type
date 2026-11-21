@@ -56,3 +56,16 @@ Keyboard simulation sends keystrokes to whichever application currently has focu
 - Switched generation requests to Google's Interactions API.
 - Added a scrollable main window and larger default dimensions to prevent clipped controls.
 - Added optional secure API-key storage through Windows Credential Manager (`keyring`).
+
+## v1.2 generation responsiveness fix
+
+- Gemini generation now streams response text into the worker instead of waiting silently for the full response.
+- The activity log reports response progress as text arrives.
+- A 180-second request timeout turns stalled calls into a visible error instead of an indefinite wait.
+
+## v1.3 Gemini streaming compatibility update
+
+- Uses the standard Gemini `generateContent` streaming endpoint (`generate_content_stream`) rather than the Interactions API.
+- Reads streamed text from each chunk's `.text` field.
+- Keeps a 180-second HTTP timeout and progress updates while text arrives.
+- Recommended when the app only needs one-shot website/project generation rather than persistent multi-turn interactions.

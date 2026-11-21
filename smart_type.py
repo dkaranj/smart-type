@@ -85,12 +85,38 @@ paths or ../. Do not include secrets or API keys in generated files.
 User brief:
 {self.prompt}
 """
-            self.status.emit("Generating your website with Gemini…")
-            interaction = client.interactions.create(
+            self.status.emit("Generating with Gemini… waiting for first response chunk.")
+            # Use the standard Gemini streaming generation endpoint.
+            # This avoids the Interactions API event-schema changes and exposes
+            # each generated text chunk directly as chunk.text.
+            chunks = []
+            last_update = time.monotonic()
+            stream = client.models.generate_content_stream(
                 model=self.model,
-                input=instruction
+                contents=instruction,
+                config={"http_options": {"timeout": 180000}},
             )
-            data = extract_json(interaction.output_text or "")
+            for chunk in stream:
+                piece = getattr(chunk, "text", None)
+                if piece:
+                    chunks.append(piece)
+                    now = time.monotonic()
+                    if now - last_update >= 1:
+                        received = sum(len(part) for part in chunks)
+                        self.status.emit(
+                            f"Gemini is writing your project… {received:,} characters received."
+                        )
+                        last_update = now
+            response_text = "".join(chunks).strip()
+            if not response_text:
+                raise RuntimeError(
+                    "Gemini returned an empty response. Check that the selected model is enabled "
+                    "for this API key and that your Google AI Studio quota is available."
+                )
+            self.status.emit(
+                f"Gemini response received ({len(response_text):,} characters). Preparing project files…"
+            )
+            data = extract_json(response_text)
             if not isinstance(data.get("files"), list) or not data["files"]:
                 raise ValueError("Gemini returned no project files.")
             self.finished_project.emit(data)
