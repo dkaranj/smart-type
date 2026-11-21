@@ -1,67 +1,58 @@
 # Smart Type
 
-Smart Type is a Windows desktop website builder. Describe a website, ask Gemini to generate its project files, choose a local folder, then use simulated keyboard input to type the generated code into Visual Studio Code at a speed you control.
+Smart Type is a Windows desktop MVP for generating website projects with Google's Gemini API, saving generated files into a folder you choose, opening that folder in Visual Studio Code, and optionally simulating keyboard typing into the focused editor.
 
 ## Features
 
-- Gemini integration using Google's official `google-genai` SDK.
-- Dark desktop interface built with PySide6.
-- Choose a local project folder.
-- Generate a multi-file website project.
-- Open generated files in VS Code and type them using simulated keyboard input.
-- Adjustable speed from 5 to 300 characters per second.
-- Stop control, progress bar and activity log.
-- API key stored locally using the operating system credential store through `keyring`.
+- Gemini website generation using Google's current Interactions API through the official `google-genai` SDK
+- Choose any local project folder
+- Writes generated files and creates nested directories
+- Opens the selected project in VS Code using the `code` command
+- Keyboard typing mode with adjustable speed (5–300 characters/second)
+- Pause, resume, stop and progress display
+- Windows EXE build through GitHub Actions
 
-## Requirements
+## Run from source
 
-- Windows 10/11, 64-bit.
-- Visual Studio Code installed.
-- Gemini API key from https://aistudio.google.com/apikey.
-- Python 3.10+ to run from source.
+1. Install Python 3.10 or newer.
+2. Open a terminal in this folder.
+3. Run `py -m pip install -r requirements.txt`.
+4. Run `py smart_type.py`.
+5. Paste your Gemini API key into the app.
 
-## Run from source (PowerShell)
+Get an API key from https://aistudio.google.com/app/apikey.
 
-```powershell
-py -3.12 -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
-pip install -r requirements.txt
-python smart_type.py
-```
-
-## Build locally
+## Build the EXE locally
 
 ```powershell
-pyinstaller --noconfirm --clean --onefile --windowed --name SmartType --collect-all google.genai --collect-all keyring smart_type.py
+py -m pip install -r requirements.txt
+py -m PyInstaller --noconfirm --clean --onefile --windowed --name SmartType --collect-all google.genai --collect-all pynput smart_type.py
 ```
 
 The executable will be at `dist\SmartType.exe`.
 
-## Build using GitHub Actions
+## Build with GitHub Actions
 
-1. Upload the contents of this folder to your GitHub repository `dkaranj/smart-type`.
-2. Open the repository's **Actions** tab.
-3. Select **Build Smart Type for Windows** and click **Run workflow**.
-4. When complete, open the workflow run and download the `SmartType-Windows` artifact.
-5. To publish a GitHub Release, push a version tag such as `v0.1.0`.
+Upload the contents of this folder to the root of your GitHub repository, including the hidden `.github` folder. Open **Actions → Build Smart Type for Windows → Run workflow**. Download the `SmartType-Windows` artifact after the run succeeds.
 
-## Usage
+To create a GitHub Release, push a tag such as `v1.0.0`.
 
-1. Launch SmartType.exe.
-2. Paste your Gemini API key and click **Save key**.
-3. Choose a project folder.
-4. Describe your website and click **Generate website**.
-5. Review the generated file list in the activity log.
-6. Click **Type into VS Code** and confirm the automation prompt.
-7. Keep VS Code focused until typing finishes. Use **Stop typing** to interrupt.
+## Keyboard typing safety
 
-## Safety
+Keyboard simulation sends keystrokes to whichever application currently has focus. Before starting, open the matching generated file in VS Code and click inside its editor. The app asks for confirmation and provides a five-second countdown. Test with an empty or disposable file first. The Stop button ends the typing worker.
 
-- Smart Type does not execute generated terminal commands.
-- Review generated code before running it.
-- Keyboard automation sends keystrokes to the currently focused application. Do not switch windows while typing.
-- Use a new or empty project folder for your first test. Files with matching names may be overwritten.
-- Keep your Gemini API key private. It is stored locally and is not committed to GitHub.
+## Notes and current limitations
 
-Version 0.1.0 - Initial MVP.
+- This is an initial working MVP, not a reverse-engineered copy of Bona.Bot.
+- Gemini output is parsed as JSON and written as text files. Very large projects may need a follow-up generation workflow.
+- VS Code must be installed, and its `code` command must be available on PATH. Otherwise open the selected folder manually.
+- The API key can be saved in Windows Credential Manager using the Save key button.
+- Generated project files are written directly into the selected folder. Choose a dedicated folder to avoid overwriting existing work.
+- Keyboard automation is optional. Direct file writing is the reliable default.
+
+## v1.1 fixes
+
+- Updated model choices to `gemini-3.8-flash` and `gemini-3.1-pro-preview`.
+- Switched generation requests to Google's Interactions API.
+- Added a scrollable main window and larger default dimensions to prevent clipped controls.
+- Added optional secure API-key storage through Windows Credential Manager (`keyring`).

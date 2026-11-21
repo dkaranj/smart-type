@@ -8,480 +8,498 @@ import threading
 import time
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QSettings, QThread, Signal, Qt
+from PySide6.QtCore import Qt, QThread, Signal
+from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
-    QApplication, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit,
-    QMainWindow, QMessageBox, QProgressBar, QPushButton, QSlider,
-    QTextEdit, QVBoxLayout, QWidget
+    QApplication, QCheckBox, QComboBox, QFileDialog, QFrame, QHBoxLayout,
+    QLabel, QLineEdit, QMainWindow, QMessageBox, QPushButton, QPlainTextEdit,
+    QProgressBar, QScrollArea, QSlider, QTabWidget, QVBoxLayout, QWidget
 )
+from google import genai
+from pynput.keyboard import Controller
+
+try:
+    import keyring
+except ImportError:
+    keyring = None
+
 
 APP_NAME = "Smart Type"
-ORG_NAME = "EazyRadius"
-MODELS = ["gemini-2.5-flash", "gemini-2.5-pro"]
+DEFAULT_MODEL = "gemini-3.8-flash"
 
 
-def get_keyring():
-    import keyring
-    return keyring
+def safe_relative_path(value: str) -> Path:
+    """Reject absolute paths and traversal outside the selected project."""
+    value = value.replace("\\", "/").strip()
+    p = Path(value)
+    if not value or p.is_absolute() or ".." in p.parts:
+        raise ValueError(f"Unsafe project path: {value!r}")
+    if not re.fullmatch(r"[A-Za-z0-9._ /@+-]+", value):
+        raise ValueError(f"Unsupported characters in project path: {value!r}")
+    return p
 
 
-def load_api_key():
+def extract_json(text: str):
+    text = text.strip()
+    text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.I)
+    text = re.sub(r"\s*```$", "", text)
     try:
-        return get_keyring().get_password("SmartType", "gemini_api_key") or ""
-    except Exception:
-        return ""
+        return json.loads(text)
+    except json.JSONDecodeError:
+        match = re.search(r"\{.*\}", text, flags=re.S)
+        if not match:
+            raise ValueError("Gemini did not return a valid JSON project.")
+        return json.loads(match.group(0))
 
 
-def save_api_key(value):
-    if not value.strip():
-        raise ValueError("Enter an API key first.")
-    get_keyring().set_password("SmartType", "gemini_api_key", value.strip())
-
-
-def find_vscode():
-    code = shutil.which("code")
-    if code:
-        return code
-    if sys.platform == "win32":
-        candidates = [
-            Path(os.environ.get("LOCALAPPDATA", "")) / "Programs/Microsoft VS Code/Code.exe",
-            Path(os.environ.get("ProgramFiles", "C:/Program Files")) / "Microsoft VS Code/Code.exe",
-            Path(os.environ.get("ProgramFiles(x86)", "C:/Program Files (x86)")) / "Microsoft VS Code/Code.exe",
-        ]
-        for candidate in candidates:
-            if candidate.is_file():
-                return str(candidate)
-    return None
-
-
-def parse_generated_files(raw):
-    text = raw.strip()
-    text = re.sub(r"^\s*```(?:json)?\s*", "", text, flags=re.IGNORECASE)
-    text = re.sub(r"\s*```\s*$", "", text)
-    data = json.loads(text)
-    if not isinstance(data, dict) or not isinstance(data.get("files"), list):
-        raise ValueError("Gemini response must be JSON containing a 'files' array.")
-
-    files = []
-    seen = set()
-    for item in data["files"]:
-        if not isinstance(item, dict):
-            continue
-        name = str(item.get("path", "")).replace("\\", "/").strip()
-        content = item.get("content", "")
-        if not name or not isinstance(content, str):
-            continue
-        path = Path(name)
-        if path.is_absolute() or ".." in path.parts or re.match(r"^[A-Za-z]:", name):
-            raise ValueError("Gemini returned an unsafe file path: " + name)
-        if name in seen:
-            raise ValueError("Gemini returned a duplicate file path: " + name)
-        if len(content) > 500_000:
-            raise ValueError("Generated file is too large: " + name)
-        seen.add(name)
-        files.append((name, content))
-
-    if not files:
-        raise ValueError("Gemini did not return any usable files.")
-    if len(files) > 40:
-        raise ValueError("Gemini returned more than 40 files. Try a smaller website request.")
-    return files
-
-
-class GenerateWorker(QObject):
-    succeeded = Signal(list)
+class GenerateWorker(QThread):
+    finished_project = Signal(dict)
     failed = Signal(str)
+    status = Signal(str)
 
-    def __init__(self, api_key, model, prompt):
+    def __init__(self, api_key, prompt, model):
         super().__init__()
         self.api_key = api_key
-        self.model = model
         self.prompt = prompt
+        self.model = model
 
     def run(self):
         try:
-            from google import genai
+            self.status.emit("Connecting to Gemini…")
             client = genai.Client(api_key=self.api_key)
-            instruction = (
-                "You are an expert web developer. Create a complete, responsive, runnable website "
-                "from the specification. Return ONLY valid JSON, without markdown fences, in this "
-                "exact structure: {\"files\":[{\"path\":\"relative/path\",\"content\":\"full file contents\"}]}. "
-                "Include all required code, assets as text files where practical, package/config files, "
-                "and README.md with run instructions. Do not include secrets, API keys, absolute paths, "
-                "or parent-directory paths. Keep the project self-contained."
-            )
-            response = client.models.generate_content(
+            instruction = f"""
+You are an expert web developer. Create a complete, runnable website project
+from the user's brief. Return ONLY valid JSON, no markdown fences, using this
+exact shape:
+{{
+  "project_name": "short-folder-name",
+  "summary": "brief description",
+  "files": [
+    {{"path": "index.html", "content": "complete file content"}}
+  ],
+  "run_instructions": ["step one", "step two"]
+}}
+Include every necessary file (HTML/CSS/JS or framework files as appropriate),
+a README.md, and sensible defaults. Keep paths relative. Do not use absolute
+paths or ../. Do not include secrets or API keys in generated files.
+User brief:
+{self.prompt}
+"""
+            self.status.emit("Generating your website with Gemini…")
+            interaction = client.interactions.create(
                 model=self.model,
-                contents=instruction + "\n\nWEBSITE SPECIFICATION:\n" + self.prompt,
+                input=instruction
             )
-            if not response.text:
-                raise RuntimeError("Gemini returned an empty response.")
-            self.succeeded.emit(parse_generated_files(response.text))
+            data = extract_json(interaction.output_text or "")
+            if not isinstance(data.get("files"), list) or not data["files"]:
+                raise ValueError("Gemini returned no project files.")
+            self.finished_project.emit(data)
         except Exception as exc:
             self.failed.emit(str(exc))
 
 
-class TypingWorker(QObject):
-    progress = Signal(int, str)
-    finished = Signal(bool, str)
+class TypingWorker(QThread):
+    progress = Signal(int, int)
+    status = Signal(str)
+    done = Signal()
+    failed = Signal(str)
 
-    def __init__(self, project_folder, files, characters_per_second):
+    def __init__(self, text, cps):
         super().__init__()
-        self.project_folder = Path(project_folder)
-        self.files = files
-        self.delay = 1.0 / max(1, characters_per_second)
-        self.stop_event = threading.Event()
+        self.text = text
+        self.cps = max(1, cps)
+        self._pause = threading.Event()
+        self._pause.set()
+        self._stop = threading.Event()
+        self.keyboard = Controller()
+
+    def pause(self):
+        self._pause.clear()
+
+    def resume(self):
+        self._pause.set()
 
     def stop(self):
-        self.stop_event.set()
+        self._stop.set()
+        self._pause.set()
 
     def run(self):
         try:
-            from pynput.keyboard import Controller, Key
-            keyboard = Controller()
-            vscode = find_vscode()
-            if not vscode:
-                raise RuntimeError(
-                    "Visual Studio Code was not found. Install VS Code and make sure its 'code' command is available."
-                )
-
-            total = sum(max(1, len(content)) for _, content in self.files)
-            typed = 0
-
-            for index, (relative_path, content) in enumerate(self.files, start=1):
-                if self.stop_event.is_set():
-                    self.finished.emit(False, "Typing was stopped.")
-                    return
-
-                target = self.project_folder / relative_path
-                target.parent.mkdir(parents=True, exist_ok=True)
-                target.touch(exist_ok=True)
-
-                # Open the target file in VS Code. The short delay allows the editor to focus.
-                subprocess.Popen([vscode, "--reuse-window", str(target)])
-                time.sleep(1.8)
-
-                # Select the editor contents before entering the generated file.
-                with keyboard.pressed(Key.ctrl):
-                    keyboard.press("a")
-                    keyboard.release("a")
-                time.sleep(0.15)
-
-                for character in content:
-                    if self.stop_event.is_set():
-                        self.finished.emit(
-                            False,
-                            "Typing was stopped. The current file may be incomplete; review it in VS Code."
-                        )
-                        return
-                    keyboard.type(character)
-                    if self.delay > 0.001:
-                        time.sleep(self.delay)
-                    typed += 1
-                    if typed % 100 == 0:
-                        percent = int(typed * 100 / max(total, 1))
-                        self.progress.emit(percent, "Typing " + relative_path)
-
-                with keyboard.pressed(Key.ctrl):
-                    keyboard.press("s")
-                    keyboard.release("s")
-
-                percent = int(typed * 100 / max(total, 1))
-                self.progress.emit(percent, "Saved " + relative_path + " (" + str(index) + "/" + str(len(self.files)) + ")")
-
-            self.finished.emit(True, "All generated files have been typed and saved in Visual Studio Code.")
+            total = len(self.text)
+            delay = 1.0 / self.cps
+            self.status.emit("Typing started. Keep the intended editor focused.")
+            for index, char in enumerate(self.text, start=1):
+                if self._stop.is_set():
+                    self.status.emit("Typing stopped.")
+                    break
+                self._pause.wait()
+                if self._stop.is_set():
+                    break
+                self.keyboard.type(char)
+                self.progress.emit(index, total)
+                if char not in "\r\n":
+                    time.sleep(delay)
+            self.done.emit()
         except Exception as exc:
-            self.finished.emit(False, str(exc))
+            self.failed.emit(str(exc))
 
 
-class MainWindow(QMainWindow):
+class SmartTypeWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Smart Type | Gemini Website Builder")
-        self.setMinimumSize(960, 720)
-        self.settings = QSettings(ORG_NAME, APP_NAME)
+        self.resize(1180, 900)
+        self.setMinimumSize(900, 650)
+        self.project_data = None
+        self.project_dir = None
+        self.typing_worker = None
         self.generated_files = []
-        self.generate_thread = None
-        self.type_thread = None
-        self.type_worker = None
         self._build_ui()
-        self.folder_edit.setText(self.settings.value("project_folder", ""))
-        self.api_key_edit.setText(load_api_key())
 
     def _build_ui(self):
         self.setStyleSheet("""
-            QMainWindow, QWidget { background: #0b1220; color: #e5edf8; font-family: Segoe UI; }
-            QFrame#panel { background: #111c2e; border: 1px solid #26364d; border-radius: 12px; }
-            QLabel#muted { color: #8fa3bd; }
-            QLineEdit, QTextEdit, QComboBox { background: #08101d; border: 1px solid #30435e; border-radius: 8px; padding: 10px; color: #eef5ff; }
-            QPushButton { background: #087eaa; border: 0; border-radius: 8px; padding: 11px 16px; color: white; font-weight: 600; }
-            QPushButton:hover { background: #0b9acb; }
-            QPushButton:disabled { background: #334155; color: #94a3b8; }
-            QPushButton#secondary { background: #26364d; }
-            QPushButton#danger { background: #9f3545; }
-            QSlider::groove:horizontal { height: 6px; background: #26364d; border-radius: 3px; }
-            QSlider::handle:horizontal { background: #20b8df; width: 16px; margin: -5px 0; border-radius: 8px; }
-            QProgressBar { background: #08101d; border: 1px solid #30435e; border-radius: 6px; text-align: center; height: 18px; }
-            QProgressBar::chunk { background: #08a5c9; border-radius: 5px; }
+            QMainWindow, QWidget { background:#101827; color:#e8eef8; }
+            QFrame#panel { background:#172338; border:1px solid #293a55; border-radius:12px; }
+            QLineEdit, QPlainTextEdit, QComboBox {
+                background:#0d1523; color:#f2f6ff; border:1px solid #344761;
+                border-radius:7px; padding:9px; selection-background-color:#087fba;
+            }
+            QPushButton {
+                background:#087fae; color:white; border:0; border-radius:8px;
+                padding:10px 15px; font-weight:600;
+            }
+            QPushButton:hover { background:#0798c9; }
+            QPushButton:disabled { background:#39485d; color:#9aa8bb; }
+            QPushButton#secondary { background:#293a55; }
+            QLabel#muted { color:#9eb0c8; }
+            QProgressBar { border:1px solid #344761; border-radius:6px; text-align:center; background:#0d1523; }
+            QProgressBar::chunk { background:#08a6cf; border-radius:5px; }
+            QTabWidget::pane { border:1px solid #293a55; border-radius:8px; }
+            QTabBar::tab { background:#172338; padding:10px 18px; }
+            QTabBar::tab:selected { background:#087fae; }
+            QSlider::groove:horizontal { height:6px; background:#344761; border-radius:3px; }
+            QSlider::handle:horizontal { background:#08a6cf; width:16px; margin:-5px 0; border-radius:8px; }
         """)
-
-        root = QWidget()
-        self.setCentralWidget(root)
-        layout = QVBoxLayout(root)
-        layout.setContentsMargins(25, 20, 25, 20)
-        layout.setSpacing(13)
+        central = QWidget()
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setWidget(central)
+        self.setCentralWidget(scroll)
+        central.setMinimumWidth(860)
+        central.setMinimumHeight(900)
+        layout = QVBoxLayout(central)
+        layout.setContentsMargins(24, 20, 24, 20)
+        layout.setSpacing(14)
 
         header = QHBoxLayout()
-        brand = QVBoxLayout()
         title = QLabel("SMART TYPE")
-        title.setStyleSheet("font-size: 27px; font-weight: 800; letter-spacing: 2px; color: #32c5e8;")
-        subtitle = QLabel("Gemini-powered website builder • Windows desktop")
+        title.setFont(QFont("Segoe UI", 22, QFont.Bold))
+        title.setStyleSheet("color:#31c5e8;")
+        subtitle = QLabel("Gemini-powered website builder")
         subtitle.setObjectName("muted")
-        brand.addWidget(title)
-        brand.addWidget(subtitle)
-        header.addLayout(brand)
+        header.addWidget(title)
+        header.addSpacing(12)
+        header.addWidget(subtitle)
         header.addStretch()
-        self.status = QLabel("● Ready")
-        self.status.setStyleSheet("color: #5bd6a3; font-weight: 700;")
-        header.addWidget(self.status)
         layout.addLayout(header)
 
-        key_panel = QFrame()
-        key_panel.setObjectName("panel")
+        self.tabs = QTabWidget()
+        self.tabs.setMinimumHeight(680)
+        self.tabs.setSizePolicy(self.tabs.sizePolicy().horizontalPolicy(), self.tabs.sizePolicy().verticalPolicy())
+        layout.addWidget(self.tabs, 1)
+
+        build_tab = QWidget()
+        build_layout = QVBoxLayout(build_tab)
+        build_layout.setSpacing(12)
+
+        key_panel = QFrame(objectName="panel")
         key_layout = QVBoxLayout(key_panel)
-        key_layout.addWidget(QLabel("GEMINI API KEY"))
+        key_layout.addWidget(QLabel("Gemini API key"))
         key_row = QHBoxLayout()
-        self.api_key_edit = QLineEdit()
-        self.api_key_edit.setEchoMode(QLineEdit.Password)
-        self.api_key_edit.setPlaceholderText("Paste your Gemini API key")
-        save_key = QPushButton("Save key")
-        save_key.setObjectName("secondary")
-        save_key.clicked.connect(self.save_key)
-        key_row.addWidget(self.api_key_edit, 1)
-        key_row.addWidget(save_key)
+        self.api_key = QLineEdit()
+        self.api_key.setPlaceholderText("Paste your Google Gemini API key")
+        self.api_key.setEchoMode(QLineEdit.Password)
+        key_row.addWidget(self.api_key)
+        self.save_key_btn = QPushButton("Save key")
+        self.save_key_btn.setObjectName("secondary")
+        self.save_key_btn.clicked.connect(self.save_api_key)
+        key_row.addWidget(self.save_key_btn)
+        self.show_key = QCheckBox("Show")
+        self.show_key.toggled.connect(
+            lambda checked: self.api_key.setEchoMode(QLineEdit.Normal if checked else QLineEdit.Password)
+        )
+        key_row.addWidget(self.show_key)
         key_layout.addLayout(key_row)
-        self.model = __import__("PySide6.QtWidgets", fromlist=["QComboBox"]).QComboBox()
-        self.model.addItems(MODELS)
         model_row = QHBoxLayout()
-        model_row.addWidget(QLabel("Gemini model"))
+        model_row.addWidget(QLabel("Model"))
+        self.model = QComboBox()
+        self.model.addItems(["gemini-3.8-flash", "gemini-3.1-pro-preview"])
         model_row.addWidget(self.model)
         model_row.addStretch()
         key_layout.addLayout(model_row)
-        layout.addWidget(key_panel)
+        build_layout.addWidget(key_panel)
 
-        folder_panel = QFrame()
-        folder_panel.setObjectName("panel")
-        folder_layout = QVBoxLayout(folder_panel)
-        folder_layout.addWidget(QLabel("PROJECT FOLDER"))
-        folder_row = QHBoxLayout()
-        self.folder_edit = QLineEdit()
-        self.folder_edit.setPlaceholderText("Choose where the website project should live")
-        browse = QPushButton("Browse folder")
-        browse.setObjectName("secondary")
-        browse.clicked.connect(self.choose_folder)
-        folder_row.addWidget(self.folder_edit, 1)
-        folder_row.addWidget(browse)
-        folder_layout.addLayout(folder_row)
-        layout.addWidget(folder_panel)
-
-        prompt_panel = QFrame()
-        prompt_panel.setObjectName("panel")
+        prompt_panel = QFrame(objectName="panel")
         prompt_layout = QVBoxLayout(prompt_panel)
-        prompt_layout.addWidget(QLabel("DESCRIBE THE WEBSITE YOU WANT"))
-        self.prompt_edit = QTextEdit()
-        self.prompt_edit.setMinimumHeight(150)
-        self.prompt_edit.setPlaceholderText(
-            "Example: Build a modern ISP website with a homepage, internet packages, customer login, "
-            "coverage checker, contact form and responsive mobile layout..."
+        prompt_layout.addWidget(QLabel("Describe the website you want"))
+        self.prompt = QPlainTextEdit()
+        self.prompt.setPlaceholderText(
+            "Example: Build a modern ISP website for EazyRadius with a homepage, "
+            "internet packages, coverage checker, customer login and contact page…"
         )
-        prompt_layout.addWidget(self.prompt_edit)
-        layout.addWidget(prompt_panel, 1)
+        self.prompt.setMinimumHeight(150)
+        prompt_layout.addWidget(self.prompt)
+        folder_row = QHBoxLayout()
+        self.folder_label = QLabel("No project folder selected")
+        self.folder_label.setObjectName("muted")
+        choose = QPushButton("Choose project folder")
+        choose.setObjectName("secondary")
+        choose.clicked.connect(self.choose_folder)
+        folder_row.addWidget(self.folder_label, 1)
+        folder_row.addWidget(choose)
+        prompt_layout.addLayout(folder_row)
+        build_layout.addWidget(prompt_panel)
 
-        speed_panel = QFrame()
-        speed_panel.setObjectName("panel")
-        speed_layout = QVBoxLayout(speed_panel)
-        speed_row = QHBoxLayout()
-        speed_row.addWidget(QLabel("KEYBOARD TYPING SPEED"))
-        speed_row.addStretch()
-        self.speed_label = QLabel("80 characters/sec")
-        self.speed_label.setStyleSheet("color: #32c5e8; font-weight: 700;")
-        speed_row.addWidget(self.speed_label)
-        speed_layout.addLayout(speed_row)
-        self.speed_slider = QSlider(Qt.Horizontal)
-        self.speed_slider.setRange(5, 300)
-        self.speed_slider.setValue(80)
-        self.speed_slider.valueChanged.connect(
-            lambda value: self.speed_label.setText(str(value) + " characters/sec")
-        )
-        speed_layout.addWidget(self.speed_slider)
-        hint = QLabel("5 = slow typing • 300 = very fast typing. Keep VS Code focused during automation.")
-        hint.setObjectName("muted")
-        speed_layout.addWidget(hint)
-        layout.addWidget(speed_panel)
+        actions = QHBoxLayout()
+        self.generate_btn = QPushButton("Generate website")
+        self.generate_btn.clicked.connect(self.generate)
+        self.open_vscode_btn = QPushButton("Open in VS Code")
+        self.open_vscode_btn.setObjectName("secondary")
+        self.open_vscode_btn.clicked.connect(self.open_vscode)
+        self.open_vscode_btn.setEnabled(False)
+        actions.addWidget(self.generate_btn)
+        actions.addWidget(self.open_vscode_btn)
+        build_layout.addLayout(actions)
 
-        buttons = QHBoxLayout()
-        self.generate_button = QPushButton("✦  Generate website")
-        self.generate_button.clicked.connect(self.generate_website)
-        self.type_button = QPushButton("⌨  Type into VS Code")
-        self.type_button.setObjectName("secondary")
-        self.type_button.setEnabled(False)
-        self.type_button.clicked.connect(self.start_typing)
-        self.stop_button = QPushButton("Stop typing")
-        self.stop_button.setObjectName("danger")
-        self.stop_button.setEnabled(False)
-        self.stop_button.clicked.connect(self.stop_typing)
-        buttons.addWidget(self.generate_button)
-        buttons.addWidget(self.type_button)
-        buttons.addWidget(self.stop_button)
-        layout.addLayout(buttons)
-
-        self.progress = QProgressBar()
-        self.progress.setValue(0)
-        layout.addWidget(self.progress)
-        self.log = QTextEdit()
+        self.log = QPlainTextEdit()
         self.log.setReadOnly(True)
-        self.log.setMaximumHeight(110)
-        self.log.setPlaceholderText("Activity log...")
-        layout.addWidget(self.log)
+        self.log.setMaximumBlockCount(1000)
+        self.log.setPlaceholderText("Smart Type activity will appear here.")
+        build_layout.addWidget(self.log, 1)
+        self.tabs.addTab(build_tab, "Website Builder")
 
-        footer = QLabel(
-            "Smart Type does not execute generated terminal commands. Review generated code before running it. "
-            "Use a new or empty folder for your first test."
+        typing_tab = QWidget()
+        typing_layout = QVBoxLayout(typing_tab)
+        typing_panel = QFrame(objectName="panel")
+        tp = QVBoxLayout(typing_panel)
+        tp.addWidget(QLabel("Keyboard simulation"))
+        note = QLabel(
+            "Select a generated file, open it in VS Code, click inside the editor, "
+            "then start typing. A 5-second countdown gives you time to focus the editor."
         )
+        note.setWordWrap(True)
+        note.setObjectName("muted")
+        tp.addWidget(note)
+        self.file_combo = QComboBox()
+        self.file_combo.currentIndexChanged.connect(self.preview_selected_file)
+        tp.addWidget(self.file_combo)
+        self.speed_label = QLabel("Typing speed: 40 characters/second")
+        tp.addWidget(self.speed_label)
+        self.speed = QSlider(Qt.Horizontal)
+        self.speed.setRange(5, 300)
+        self.speed.setValue(40)
+        self.speed.valueChanged.connect(lambda v: self.speed_label.setText(f"Typing speed: {v} characters/second"))
+        tp.addWidget(self.speed)
+        self.countdown = QCheckBox("Use 5-second focus countdown")
+        self.countdown.setChecked(True)
+        tp.addWidget(self.countdown)
+        self.preview = QPlainTextEdit()
+        self.preview.setReadOnly(True)
+        self.preview.setPlaceholderText("Choose a generated file to preview its contents.")
+        tp.addWidget(self.preview, 1)
+        self.type_progress = QProgressBar()
+        self.type_progress.setValue(0)
+        tp.addWidget(self.type_progress)
+        controls = QHBoxLayout()
+        self.start_type = QPushButton("Start typing")
+        self.start_type.clicked.connect(self.start_typing)
+        self.pause_type = QPushButton("Pause")
+        self.pause_type.setObjectName("secondary")
+        self.pause_type.clicked.connect(self.pause_typing)
+        self.resume_type = QPushButton("Resume")
+        self.resume_type.setObjectName("secondary")
+        self.resume_type.clicked.connect(self.resume_typing)
+        self.stop_type = QPushButton("Stop")
+        self.stop_type.setObjectName("secondary")
+        self.stop_type.clicked.connect(self.stop_typing)
+        for button in (self.start_type, self.pause_type, self.resume_type, self.stop_type):
+            controls.addWidget(button)
+        tp.addLayout(controls)
+        typing_layout.addWidget(typing_panel)
+        self.tabs.addTab(typing_tab, "Keyboard Typing")
+
+        footer = QLabel("API key stays on this PC. Save key stores it in Windows Credential Manager.")
         footer.setObjectName("muted")
-        footer.setWordWrap(True)
         layout.addWidget(footer)
 
     def log_message(self, message):
-        self.log.append(message)
+        self.log.appendPlainText(message)
 
-    def save_key(self):
+    def choose_folder(self):
+        folder = QFileDialog.getExistingDirectory(self, "Choose project folder")
+        if folder:
+            self.project_dir = Path(folder)
+            self.folder_label.setText(str(self.project_dir))
+
+    def save_api_key(self):
+        key = self.api_key.text().strip()
+        if not key:
+            QMessageBox.warning(self, "API key missing", "Paste your Gemini API key first.")
+            return
+        if not keyring:
+            QMessageBox.warning(self, "Secure storage unavailable",
+                                "Install the keyring package to save the key securely. "
+                                "The key can still be used for this session.")
+            return
         try:
-            save_api_key(self.api_key_edit.text())
+            keyring.set_password("SmartType", "GeminiAPI", key)
             self.log_message("Gemini API key saved in the Windows credential store.")
-            QMessageBox.information(self, "Saved", "Your Gemini API key has been saved securely.")
+            QMessageBox.information(self, "Saved", "Gemini API key saved securely in Windows Credential Manager.")
         except Exception as exc:
             QMessageBox.critical(self, "Could not save key", str(exc))
 
-    def choose_folder(self):
-        folder = QFileDialog.getExistingDirectory(
-            self, "Choose website project folder",
-            self.folder_edit.text() or str(Path.home() / "Desktop")
-        )
-        if folder:
-            self.folder_edit.setText(folder)
-            self.settings.setValue("project_folder", folder)
-
-    def generate_website(self):
-        api_key = self.api_key_edit.text().strip()
-        prompt = self.prompt_edit.toPlainText().strip()
-        folder = self.folder_edit.text().strip()
-        if not api_key:
-            QMessageBox.warning(self, "API key required", "Enter your Gemini API key first.")
+    def generate(self):
+        key = self.api_key.text().strip()
+        brief = self.prompt.toPlainText().strip()
+        if not key:
+            QMessageBox.warning(self, "Gemini API key required", "Enter your Gemini API key first.")
             return
-        if not prompt:
-            QMessageBox.warning(self, "Description required", "Describe the website you want.")
+        if not brief:
+            QMessageBox.warning(self, "Website description required", "Describe the website you want to build.")
             return
-        if not folder:
-            QMessageBox.warning(self, "Folder required", "Choose a project folder.")
+        if not self.project_dir:
+            self.choose_folder()
+            if not self.project_dir:
+                return
+        self.generate_btn.setEnabled(False)
+        self.log_message("Starting website generation…")
+        self.worker = GenerateWorker(key, brief, self.model.currentText())
+        self.worker.status.connect(self.log_message)
+        self.worker.failed.connect(self.generation_failed)
+        self.worker.finished_project.connect(self.save_project)
+        self.worker.start()
+
+    def generation_failed(self, message):
+        self.generate_btn.setEnabled(True)
+        self.log_message("ERROR: " + message)
+        QMessageBox.critical(self, "Generation failed", message)
+
+    def save_project(self, data):
+        try:
+            files = data["files"]
+            written = []
+            for item in files:
+                rel = safe_relative_path(str(item.get("path", "")))
+                content = item.get("content", "")
+                if not isinstance(content, str):
+                    raise ValueError(f"File content must be text: {rel}")
+                target = self.project_dir / rel
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(content, encoding="utf-8", newline="")
+                written.append((str(rel).replace("\\", "/"), content))
+            self.project_data = data
+            self.generated_files = written
+            self.file_combo.clear()
+            for name, _ in written:
+                self.file_combo.addItem(name)
+            self.open_vscode_btn.setEnabled(True)
+            self.generate_btn.setEnabled(True)
+            self.log_message(f"Created {len(written)} files in {self.project_dir}")
+            self.log_message("Project summary: " + str(data.get("summary", "Website generated.")))
+            for instruction in data.get("run_instructions", []):
+                self.log_message("Run: " + str(instruction))
+            if written:
+                self.preview.setPlainText(written[0][1])
+            QMessageBox.information(self, "Website generated", f"Created {len(written)} files in:\n{self.project_dir}")
+        except Exception as exc:
+            self.generate_btn.setEnabled(True)
+            self.generation_failed(str(exc))
+
+    def open_vscode(self):
+        if not self.project_dir:
             return
+        try:
+            subprocess.Popen(["code", str(self.project_dir)])
+            self.log_message("Opened project in Visual Studio Code.")
+        except FileNotFoundError:
+            QMessageBox.warning(
+                self, "VS Code command not found",
+                "The 'code' command was not found. In VS Code, enable 'Shell Command: Install code command in PATH', "
+                "or launch VS Code manually and open this folder:\n" + str(self.project_dir)
+            )
 
-        self.settings.setValue("project_folder", folder)
-        self.generate_button.setEnabled(False)
-        self.type_button.setEnabled(False)
-        self.status.setText("● Generating with Gemini...")
-        self.log_message("Sending your website description to Gemini...")
-
-        self.generate_thread = QThread()
-        self.generate_worker = GenerateWorker(api_key, self.model.currentText(), prompt)
-        self.generate_worker.moveToThread(self.generate_thread)
-        self.generate_thread.started.connect(self.generate_worker.run)
-        self.generate_worker.succeeded.connect(self.generated)
-        self.generate_worker.failed.connect(self.generation_failed)
-        self.generate_worker.succeeded.connect(self.generate_thread.quit)
-        self.generate_worker.failed.connect(self.generate_thread.quit)
-        self.generate_thread.finished.connect(self.generate_thread.deleteLater)
-        self.generate_thread.start()
-
-    def generated(self, files):
-        self.generated_files = files
-        self.generate_button.setEnabled(True)
-        self.type_button.setEnabled(True)
-        self.progress.setValue(0)
-        self.status.setText("● " + str(len(files)) + " files generated")
-        self.log_message("Gemini generated these files:")
-        for name, content in files:
-            self.log_message(" • " + name + " (" + format(len(content), ",") + " characters)")
-        QMessageBox.information(
-            self, "Website generated",
-            str(len(files)) + " files generated. Review the list in the activity log, then click Type into VS Code."
-        )
-
-    def generation_failed(self, error):
-        self.generate_button.setEnabled(True)
-        self.status.setText("● Generation failed")
-        self.log_message("ERROR: " + error)
-        QMessageBox.critical(self, "Gemini error", error)
+    def preview_selected_file(self, index):
+        if 0 <= index < len(self.generated_files):
+            self.preview.setPlainText(self.generated_files[index][1])
 
     def start_typing(self):
-        folder = self.folder_edit.text().strip()
-        if not self.generated_files or not folder:
+        index = self.file_combo.currentIndex()
+        if index < 0 or not self.generated_files:
+            QMessageBox.warning(self, "No file selected", "Generate a project and select a file first.")
             return
-        names = "\n".join("• " + name for name, _ in self.generated_files)
+        if self.typing_worker and self.typing_worker.isRunning():
+            QMessageBox.warning(self, "Typing in progress", "Stop the current typing session first.")
+            return
+        text = self.generated_files[index][1]
+        if not text:
+            return
         answer = QMessageBox.question(
             self, "Confirm keyboard automation",
-            "Smart Type will open each generated file in VS Code and type its contents using simulated keyboard input.\n\n"
-            + names + "\n\nUse a new/empty project folder. Keep VS Code focused and do not switch windows. Start?",
-            QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+            "Smart Type will send keystrokes to whichever window has focus. "
+            "Open the matching file in VS Code, click inside its editor, then continue.\n\n"
+            "Start the 5-second countdown?",
+            QMessageBox.Yes | QMessageBox.No
         )
         if answer != QMessageBox.Yes:
             return
+        self.tabs.setCurrentIndex(1)
+        if self.countdown.isChecked():
+            for seconds in range(5, 0, -1):
+                self.log_message(f"Typing begins in {seconds}…")
+                QApplication.processEvents()
+                time.sleep(1)
+        self.type_progress.setMaximum(len(text))
+        self.type_progress.setValue(0)
+        self.typing_worker = TypingWorker(text, self.speed.value())
+        self.typing_worker.progress.connect(self.update_typing_progress)
+        self.typing_worker.status.connect(self.log_message)
+        self.typing_worker.failed.connect(lambda e: self.log_message("Typing error: " + e))
+        self.typing_worker.done.connect(lambda: self.log_message("Typing session finished."))
+        self.typing_worker.start()
 
-        Path(folder).mkdir(parents=True, exist_ok=True)
-        self.generate_button.setEnabled(False)
-        self.type_button.setEnabled(False)
-        self.stop_button.setEnabled(True)
-        self.status.setText("● Typing into VS Code...")
-        self.log_message("Keyboard automation started. Keep VS Code focused.")
+    def update_typing_progress(self, current, total):
+        self.type_progress.setMaximum(max(1, total))
+        self.type_progress.setValue(current)
 
-        self.type_thread = QThread()
-        self.type_worker = TypingWorker(folder, self.generated_files, self.speed_slider.value())
-        self.type_worker.moveToThread(self.type_thread)
-        self.type_thread.started.connect(self.type_worker.run)
-        self.type_worker.progress.connect(self.typing_progress)
-        self.type_worker.finished.connect(self.typing_finished)
-        self.type_worker.finished.connect(self.type_thread.quit)
-        self.type_thread.finished.connect(self.type_thread.deleteLater)
-        self.type_thread.start()
+    def pause_typing(self):
+        if self.typing_worker and self.typing_worker.isRunning():
+            self.typing_worker.pause()
+            self.log_message("Typing paused.")
 
-    def typing_progress(self, value, message):
-        self.progress.setValue(value)
-        self.log_message(message)
+    def resume_typing(self):
+        if self.typing_worker and self.typing_worker.isRunning():
+            self.typing_worker.resume()
+            self.log_message("Typing resumed.")
 
     def stop_typing(self):
-        if self.type_worker:
-            self.type_worker.stop()
-            self.stop_button.setEnabled(False)
-            self.log_message("Stop requested...")
+        if self.typing_worker and self.typing_worker.isRunning():
+            self.typing_worker.stop()
+            self.log_message("Stopping keyboard automation…")
 
-    def typing_finished(self, success, message):
-        self.generate_button.setEnabled(True)
-        self.type_button.setEnabled(bool(self.generated_files))
-        self.stop_button.setEnabled(False)
-        self.status.setText("● Complete" if success else "● Stopped / error")
-        self.log_message(message)
-        if success:
-            self.progress.setValue(100)
-            QMessageBox.information(self, "Smart Type", message)
-        else:
-            QMessageBox.warning(self, "Smart Type", message)
+    def closeEvent(self, event):
+        if self.typing_worker and self.typing_worker.isRunning():
+            self.typing_worker.stop()
+            self.typing_worker.wait(1500)
+        event.accept()
 
 
 def main():
     app = QApplication(sys.argv)
-    app.setOrganizationName(ORG_NAME)
     app.setApplicationName(APP_NAME)
-    window = MainWindow()
+    window = SmartTypeWindow()
     window.show()
     sys.exit(app.exec())
 
