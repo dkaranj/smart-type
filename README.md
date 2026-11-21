@@ -1,27 +1,26 @@
-# Smart Type Emulator
+# Smart Type Emulator v2.1
 
-A Windows desktop app that loads existing text files or recursively imports a source folder, chooses a destination workspace, opens destination files in Visual Studio Code, and replays each file's contents using simulated keyboard input.
+Windows desktop app that loads text files or a folder and replays their contents as keyboard input in VS Code.
 
-## Workflow
-1. **Add files** to choose individual text files, or **Load folder** to import all files recursively.
-2. Choose the destination VS Code workspace folder.
-3. Preview the files and set typing speed (1–300 characters/second).
-4. Start emulation. Smart Type creates destination files, opens them in VS Code, and types their contents.
-5. Pause, resume, or stop the queue.
+## v2.1 fixes
+- Responsive, scrollable interface so controls and logs are not clipped on smaller screens.
+- Detects VS Code from PATH and common Windows install folders.
+- Adds a **Browse Code.exe** control for installations in custom locations.
+- Replaces the previous unreliable control-character shortcuts with explicit Ctrl+A and Backspace key events.
+- Adds a five-second focus countdown. Click inside the VS Code editor during the countdown.
 
-## Build
-Upload the contents of this folder to the root of your GitHub repository, including `.github/workflows/build-windows.yml`. Run **Actions → Build Smart Type Emulator** and download the `SmartType-Windows` artifact.
+## Build with GitHub Actions
+1. Extract this ZIP.
+2. Upload the contents of `SmartType-Emulator` to the root of your `dkaranj/smart-type` repository, replacing the old files.
+3. Commit to `main`.
+4. Open **Actions → Build Smart Type Emulator → Run workflow**.
+5. Download the `SmartType-Windows` artifact and extract `SmartType.exe`.
 
-Local run:
+## Local run
 ```powershell
 py -m pip install -r requirements.txt
 py smart_type.py
 ```
 
-## Requirements and safety
-- Windows, Python 3.10+ if running from source, Visual Studio Code installed.
-- The `code` command must be available on PATH. If not, disable automatic opening and open the destination workspace manually.
-- Only UTF-8 text files are supported. Binary files are skipped.
-- The destination files are created/overwritten. Choose a dedicated workspace folder.
-- Keyboard simulation sends keystrokes to the currently focused window. Keep VS Code focused and do not use the computer during emulation. Test on disposable files first.
-- This is a file replay tool. It does not call Gemini or generate new website code.
+## Important
+Smart Type sends keystrokes to whichever window has focus. During each countdown, click inside the intended VS Code editor. Do not use the computer while replay is running. Destination files can be overwritten.
